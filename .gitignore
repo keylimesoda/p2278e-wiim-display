@@ -1,0 +1,29 @@
+# Runtime/local config
+pi-app/config.json
+pi-app/discovery/*.xml
+pi-app/display.lock
+
+# Generated/runtime artifacts
+pi-app/bin/
+pi-app/build/
+pi-app/cache/
+pi-app/logs/
+pi-app/run/
+pi-app/.pytest_cache/
+pi-app/src/**/__pycache__/
+pi-app/scripts/**/__pycache__/
+pi-app/tests/**/__pycache__/
+output/
+design/art-resampling/
+*.pyc
+
+# Local snapshots / archives
+*.tgz
+*.tar.gz
+*.zip
+
+# OS/editor noise
+.DS_Store
+
+# Internal release-review artifacts
+reports/public-release-review-*.md

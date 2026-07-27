@@ -1,0 +1,12 @@
+{
+  "wiim_base_url": null,
+  "friendly_name": null,
+  "visualization": "spectrum",
+  "brightness": 0.6,
+  "fps": 30,
+  "stale_seconds": 12,
+  "clear_seconds": 45,
+  "idle_dim": true,
+  "no_info_timeout_seconds": 900,
+  "panel_profile": "adafruit-p2278e-rpi5-bonnet-64x32"
+}

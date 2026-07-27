@@ -1,0 +1,54 @@
+[Unit]
+Description=P2278E LAN maintenance web interface (independent of the display)
+Documentation=file://@APP_DIR@/src/p2278e_display/admin.py
+After=local-fs.target network-online.target
+Wants=network-online.target
+# Intentionally NOT bound to the display unit: the maintenance UI must be
+# independent so display failures never take the admin surface down, and an
+# admin-surface failure never affects the primary appliance.
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=@APP_USER@
+Group=@APP_GROUP@
+WorkingDirectory=@APP_DIR@
+
+# Bind: default is loopback (127.0.0.1) for safety. To expose on the LAN,
+# change P2278E_ADMIN_BIND to the LAN address (e.g. 0.0.0.0 or a specific
+# interface IP). Read endpoints are open on LAN; all POST mutations require a
+# bearer admin token (see P2278E_ADMIN_TOKEN_FILE below).
+Environment=PYTHONUNBUFFERED=1
+Environment=P2278E_ADMIN_BIND=@ADMIN_BIND@
+Environment=P2278E_ADMIN_PORT=8787
+# Token file is read at startup; keep it root- or user-readable and out of git.
+Environment=P2278E_ADMIN_TOKEN_FILE=@APP_DIR@/run/admin.token
+
+ExecStart=@VENV_DIR@/bin/python @APP_DIR@/scripts/admin_server.py
+Restart=always
+RestartSec=3
+TimeoutStopSec=8
+KillSignal=SIGTERM
+
+# Hardening: this process only reads config/health, renders preview PNGs, and
+# writes config.json + prunes cache files. It needs no privileges, no devices,
+# and no ability to run other programs.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+# Allow writes only to the appliance working tree (config + cache) at runtime.
+ReadWritePaths=@APP_DIR@
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
