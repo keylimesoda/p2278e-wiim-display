@@ -34,6 +34,9 @@ except Exception:  # pragma: no cover - Pillow should be present
 __all__ = ["cache_album_art", "prune_cache", "validate_image_bytes"]
 
 DEFAULT_MAX_BYTES = 5_000_000
+MAX_IMAGE_DIMENSION = 4096
+MAX_IMAGE_PIXELS = 4_000_000
+ART_TILE_SIZE = 256
 _CHUNK = 64 * 1024
 
 
@@ -41,15 +44,22 @@ class ArtCacheError(Exception):
     """Raised for a caller-recoverable cache failure (bad/oversized image)."""
 
 
+def image_size_allowed(size: tuple[int, int]) -> bool:
+    width, height = size
+    return (0 < width <= MAX_IMAGE_DIMENSION and 0 < height <= MAX_IMAGE_DIMENSION
+            and width * height <= MAX_IMAGE_PIXELS)
+
+
 def validate_image_bytes(data: bytes) -> bool:
     """Return True if ``data`` decodes as an image via Pillow."""
     if not data:
         return False
     if Image is None:  # pragma: no cover
-        # No Pillow: fall back to a minimal magic-number sniff.
-        return data[:3] == b"\xff\xd8\xff" or data[:8] == b"\x89PNG\r\n\x1a\n"
+        return False
     try:
         with Image.open(io.BytesIO(data)) as im:
+            if not image_size_allowed(im.size):
+                return False
             im.verify()
         return True
     except Exception:
@@ -143,23 +153,38 @@ def cache_album_art(
     # Re-validate any existing cache entry; a truncated/corrupt file is purged.
     if path.exists():
         try:
-            existing = path.read_bytes()
+            existing = path.read_bytes() if path.stat().st_size <= max_bytes else b""
         except OSError:
             existing = b""
         if existing and validate_image_bytes(existing):
-            return str(path)
+            try:
+                with Image.open(io.BytesIO(existing)) as im:
+                    if max(im.size) <= ART_TILE_SIZE:
+                        return str(path)
+                data = existing
+            except Exception:
+                data = b""
+        else:
+            data = b""
         try:
             path.unlink()
         except OSError:
             pass
 
+    else:
+        data = b""
+
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
-        data = _download(uri, timeout, max_bytes, allow_insecure_tls, opener)
+        if not data:
+            data = _download(uri, timeout, max_bytes, allow_insecure_tls, opener)
         if not validate_image_bytes(data):
             raise ArtCacheError("downloaded bytes are not a valid image")
+        with Image.open(io.BytesIO(data)) as im:
+            im.thumbnail((ART_TILE_SIZE, ART_TILE_SIZE), Image.Resampling.LANCZOS)
+            tile = im.convert("RGB")
         with open(tmp, "wb") as fh:
-            fh.write(data)
+            tile.save(fh, format="PNG")
             fh.flush()
             try:
                 os.fsync(fh.fileno())

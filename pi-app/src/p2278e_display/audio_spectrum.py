@@ -5,11 +5,12 @@ from pathlib import Path
 import hashlib
 import json
 import shutil
+import signal
 import subprocess
-import threading
 import time
-from typing import Callable
 
+from p2278e_display.analysis_worker import AnalysisWorker, signal_process_group
+from p2278e_display.cache_io import write_bounded_json
 from p2278e_display.audio_levels import parse_hms, sample_linear, short_uri
 
 SAMPLE_RATE = 48000
@@ -17,6 +18,11 @@ BLOCK_SIZE = 2048
 HOP_SIZE = 800
 HOP_SECONDS = HOP_SIZE / SAMPLE_RATE
 BAND_COUNT = 9
+MAX_ANALYSIS_SECONDS = 180
+MAX_ANALYSIS_PCM_BYTES = 16_000_000
+MAX_FFMPEG_OUTPUT_BYTES = MAX_ANALYSIS_PCM_BYTES - 1_000_000
+MAX_CACHE_ENTRY_BYTES = 8_000_000
+MAX_CACHE_TOTAL_BYTES = 32_000_000
 MAX_CACHE_FILES = 24
 MAX_CACHE_AGE_SECONDS = 14 * 24 * 60 * 60
 MODE = "native_spectrum_fft_v2_octave2048_calibrated"
@@ -52,7 +58,7 @@ class SpectrumCache:
         return self.levels_at_seconds(seconds)
 
     def levels_at_seconds(self, seconds: float) -> tuple[float, ...]:
-        if not self.frames:
+        if not self.frames or seconds < 0 or seconds > len(self.frames) * self.hop_seconds:
             return ()
         end_pos = max(0.0, min(len(self.frames) - 1, seconds / self.hop_seconds))
         lo = int(end_pos)
@@ -66,84 +72,26 @@ class SpectrumCache:
         return tuple(out)
 
 
-class AsyncSpectrumAnalyzer:
-    """Non-blocking per-track 9-band native FFT spectrum cache manager."""
+class AsyncSpectrumAnalyzer(AnalysisWorker):
+    """At most one active analysis and one latest queued URI."""
 
-    def __init__(self, cache_dir: Path, logger: Callable[[str], None] | None = None):
-        self.cache_dir = cache_dir
-        self.logger = logger or (lambda _msg: None)
-        self.current_uri = ""
-        self.current_cache: SpectrumCache | None = None
-        self.pending_uri = ""
-        self.worker: threading.Thread | None = None
-        self.lock = threading.Lock()
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        prune_cache(self.cache_dir)
+    def _load(self, uri, cache_dir):
+        return load_cache(uri, cache_dir)
 
-    def request(self, uri: str) -> SpectrumCache | None:
-        if not uri:
-            with self.lock:
-                self.current_uri = ""
-                self.current_cache = None
-                self.pending_uri = ""
-            return None
+    def _analyze(self, uri, register_process):
+        return analyze_uri(uri, register_process=register_process)
 
-        with self.lock:
-            if uri == self.current_uri:
-                return self.current_cache
-            if uri == self.pending_uri:
-                return None
+    def _available(self):
+        return ffmpeg_available() and ANALYZER_BIN.exists()
 
-        cached = load_cache(uri, self.cache_dir)
-        if cached:
-            with self.lock:
-                self.current_uri = uri
-                self.current_cache = cached
-                self.pending_uri = ""
-            self.logger(f"spectrum cache hit frames={len(cached.frames)} uri={short_uri(uri)}")
-            return cached
+    def _path(self, cache_dir, uri):
+        return cache_path(cache_dir, uri)
 
-        if not ffmpeg_available():
-            self.logger("spectrum analysis disabled: ffmpeg not available")
-            return None
-        if not ANALYZER_BIN.exists():
-            self.logger(f"spectrum analysis disabled: native analyzer missing at {ANALYZER_BIN}")
-            return None
+    def _write(self, path, cache):
+        write_cache(path, cache)
 
-        with self.lock:
-            self.pending_uri = uri
-        self.worker = threading.Thread(target=self._worker, args=(uri,), daemon=True, name="p2278e-spectrum-analyzer")
-        self.worker.start()
-        self.logger(f"spectrum analysis queued uri={short_uri(uri)}")
-        return None
-
-    def levels_at(self, uri: str, rel_time: str) -> tuple[float, ...]:
-        cache = self.request(uri)
-        return cache.levels_at(rel_time) if cache else ()
-
-    def levels_at_seconds(self, uri: str, seconds: float) -> tuple[float, ...]:
-        cache = self.request(uri)
-        return cache.levels_at_seconds(seconds) if cache else ()
-
-    def _worker(self, uri: str) -> None:
-        try:
-            t0 = time.monotonic()
-            cache = analyze_uri(uri)
-            path = cache_path(self.cache_dir, uri)
-            tmp = path.with_suffix(".tmp")
-            write_cache(path, cache)
-            prune_cache(self.cache_dir)
-            with self.lock:
-                if self.pending_uri == uri:
-                    self.current_uri = uri
-                    self.current_cache = cache
-                    self.pending_uri = ""
-            self.logger(f"spectrum analysis ready frames={len(cache.frames)} seconds={time.monotonic() - t0:.2f} uri={short_uri(uri)}")
-        except Exception as exc:
-            with self.lock:
-                if self.pending_uri == uri:
-                    self.pending_uri = ""
-            self.logger(f"spectrum analysis failed {type(exc).__name__}")
+    def _prune(self, cache_dir):
+        prune_cache(cache_dir)
 
 
 def cache_key(uri: str) -> str:
@@ -163,6 +111,8 @@ def load_cache(uri: str, cache_dir: Path) -> SpectrumCache | None:
     if not path.exists():
         return None
     try:
+        if path.stat().st_size > MAX_CACHE_ENTRY_BYTES:
+            return None
         data = json.loads(path.read_text())
         if not data.get("frames"):
             return None
@@ -192,13 +142,10 @@ def write_cache(path: Path, cache: SpectrumCache) -> None:
         "bands": cache.bands,
         "frames": cache.frames,
     }
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, separators=(",", ":")))
-    tmp.chmod(0o600)
-    tmp.replace(path)
+    write_bounded_json(path, payload, MAX_CACHE_ENTRY_BYTES)
 
 
-def prune_cache(cache_dir: Path, max_files: int = MAX_CACHE_FILES, max_age_seconds: int = MAX_CACHE_AGE_SECONDS) -> None:
+def prune_cache(cache_dir: Path, max_files: int = MAX_CACHE_FILES, max_age_seconds: int = MAX_CACHE_AGE_SECONDS, max_total_bytes: int = MAX_CACHE_TOTAL_BYTES) -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
     now = time.time()
     for path in list(cache_dir.glob("*.spectrum.json")):
@@ -213,6 +160,16 @@ def prune_cache(cache_dir: Path, max_files: int = MAX_CACHE_FILES, max_age_secon
             path.unlink(missing_ok=True)
         except OSError:
             pass
+    total = 0
+    for path in files[:max_files]:
+        try:
+            size = path.stat().st_size
+            if total + size > max_total_bytes or size > MAX_CACHE_ENTRY_BYTES:
+                path.unlink(missing_ok=True)
+            else:
+                total += size
+        except OSError:
+            pass
     for path in cache_dir.glob("*.tmp"):
         try:
             if now - path.stat().st_mtime > 10 * 60:
@@ -221,8 +178,36 @@ def prune_cache(cache_dir: Path, max_files: int = MAX_CACHE_FILES, max_age_secon
             pass
 
 
-def analyze_uri(uri: str) -> SpectrumCache:
-    # ffmpeg handles network/file decode; native C++ handles the rolling-window FFT.
+def analysis_duration_limit() -> float:
+    """Duration cap whose mono float32 decode fits the PCM byte budget."""
+    return min(MAX_ANALYSIS_SECONDS, MAX_FFMPEG_OUTPUT_BYTES / (SAMPLE_RATE * 4))
+
+
+def _kill_and_reap(process, drain_output=False):
+    if process is None:
+        return
+    try:
+        if process.poll() is None:
+            signal_process_group(process, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        if drain_output:
+            process.communicate(timeout=1)
+        else:
+            process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        signal_process_group(process, signal.SIGKILL)
+        try:
+            process.wait(timeout=1)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    except OSError:
+        pass
+
+
+def analyze_uri(uri: str, register_process=None) -> SpectrumCache:
+    # ffmpeg's mono float32 output is capped by both duration and decoded bytes.
     ffmpeg_cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -230,6 +215,8 @@ def analyze_uri(uri: str) -> SpectrumCache:
         "error",
         "-i",
         uri,
+        "-t",
+        f"{analysis_duration_limit():.6f}",
         "-vn",
         "-ac",
         "1",
@@ -237,6 +224,8 @@ def analyze_uri(uri: str) -> SpectrumCache:
         str(SAMPLE_RATE),
         "-f",
         "f32le",
+        "-fs",
+        str(MAX_FFMPEG_OUTPUT_BYTES),
         "-",
     ]
     analyzer_cmd = [
@@ -247,27 +236,42 @@ def analyze_uri(uri: str) -> SpectrumCache:
         str(BLOCK_SIZE),
         "--hop",
         str(HOP_SIZE),
+        "--max-samples",
+        str(MAX_ANALYSIS_PCM_BYTES // 4),
         "--attack",
         "0.68",
         "--release",
         "0.14",
     ]
-    ffmpeg = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    analyzer = subprocess.Popen(analyzer_cmd, stdin=ffmpeg.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    assert ffmpeg.stdout is not None
-    ffmpeg.stdout.close()
+    ffmpeg = subprocess.Popen(
+        ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True
+    )
+    analyzer = None
+    out_bytes = b""
+    analyzer_err_bytes = b""
+    ffmpeg_rc = -1
     try:
+        if register_process:
+            register_process(ffmpeg)
+        analyzer = subprocess.Popen(
+            analyzer_cmd, stdin=ffmpeg.stdout, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, start_new_session=True,
+        )
+        if register_process:
+            register_process(analyzer)
+        assert ffmpeg.stdout is not None
+        ffmpeg.stdout.close()
         out_bytes, analyzer_err_bytes = analyzer.communicate(timeout=120)
+        ffmpeg_rc = ffmpeg.wait(timeout=10)
     except subprocess.TimeoutExpired:
-        analyzer.kill()
-        ffmpeg.kill()
-        analyzer.communicate()
-        ffmpeg.communicate()
         raise RuntimeError("spectrum analysis timed out") from None
+    finally:
+        if ffmpeg.stdout is not None:
+            ffmpeg.stdout.close()
+        _kill_and_reap(analyzer, drain_output=True)
+        _kill_and_reap(ffmpeg)
     out = out_bytes.decode("utf-8", errors="replace")
     analyzer_err = analyzer_err_bytes.decode("utf-8", errors="replace")
-    ffmpeg_err = ffmpeg.stderr.read().decode("utf-8", errors="replace") if ffmpeg.stderr else ""
-    ffmpeg_rc = ffmpeg.wait(timeout=10)
     if ffmpeg_rc != 0:
         raise RuntimeError(f"ffmpeg failed rc={ffmpeg_rc}")
     if analyzer.returncode != 0:
