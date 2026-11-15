@@ -77,3 +77,17 @@ metadata is visible to that trusted network. Never expose it to the internet.
 - software brightness scaling in the renderer
 
 The matrix backend is intentionally isolated in `src/p2278e_display/matrix.py`.
+
+### Resource limits for artwork and audio
+
+Each audio analyzer runs at most one worker (one ffmpeg process for levels,
+ffmpeg plus one native process for spectrum) and retains only the latest queued
+track. Failed tracks wait 30 seconds before another attempt. Shutdown terminates
+active child processes and bounds worker joins. Audio analysis is limited to 16 MB
+of decoded mono float32 PCM and no more than 180 seconds; later playback uses
+the normal visualization fallback. Each analyzer cache is limited to 24 files,
+32 MB total, and 8 MB per entry.
+
+Artwork downloads are limited to 5 MB, 4096 pixels per dimension, and four
+million decoded pixels. Accepted images are converted off the render loop to
+at most 256 by 256 pixels. Invalid artwork uses the fallback tile.

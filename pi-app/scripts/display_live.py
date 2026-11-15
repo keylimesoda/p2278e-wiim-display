@@ -448,6 +448,8 @@ finally:
     notify_systemd("STOPPING=1\nSTATUS=Stopping matrix renderer")
     fb[:] = 0
     matrix.show()
+    for audio_analyzer in analyzers.values():
+        audio_analyzer.close()
     metadata_pool.shutdown(wait=False, cancel_futures=True)
     art_pool.shutdown(wait=False, cancel_futures=True)
     fcntl.flock(lock_file, fcntl.LOCK_UN)

@@ -125,7 +125,12 @@ def load_album_art(path: str) -> Image.Image:
     if not path:
         return fallback_art()
     try:
-        return Image.open(Path(path)).convert("RGB")
+        from p2278e_display.art_cache import ART_TILE_SIZE, image_size_allowed
+        with Image.open(Path(path)) as image:
+            if not image_size_allowed(image.size):
+                return fallback_art()
+            image.thumbnail((ART_TILE_SIZE, ART_TILE_SIZE), Image.Resampling.LANCZOS)
+            return image.convert("RGB")
     except Exception:
         return fallback_art()
 

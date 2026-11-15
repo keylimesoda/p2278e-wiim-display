@@ -5,12 +5,16 @@ from pathlib import Path
 import hashlib
 import json
 import math
+import os
+import selectors
 import shutil
+import signal
 import subprocess
-import threading
 import time
-from typing import Callable
 from urllib.parse import unquote, urlsplit
+
+from p2278e_display.analysis_worker import AnalysisWorker, signal_process_group
+from p2278e_display.cache_io import write_bounded_json
 
 import numpy as np
 
@@ -20,6 +24,11 @@ BLOCK_SIZE = 1024
 HOP_SIZE = max(1, round(SAMPLE_RATE / 60))
 HOP_SECONDS = HOP_SIZE / SAMPLE_RATE
 HISTORY_COLUMNS = 9
+MAX_ANALYSIS_SECONDS = 180
+MAX_ANALYSIS_PCM_BYTES = 16_000_000
+MAX_FFMPEG_OUTPUT_BYTES = MAX_ANALYSIS_PCM_BYTES - 1_000_000
+MAX_CACHE_ENTRY_BYTES = 8_000_000
+MAX_CACHE_TOTAL_BYTES = 32_000_000
 MAX_CACHE_FILES = 24
 MAX_CACHE_AGE_SECONDS = 14 * 24 * 60 * 60
 EPSILON = 1e-10
@@ -51,7 +60,7 @@ class LevelCache:
 
     def levels_at_seconds(self, seconds: float) -> tuple[float, ...]:
         """Return recent meter history ending at a floating-point playback time."""
-        if not self.frames:
+        if not self.frames or seconds < 0 or seconds > len(self.frames) * self.hop_seconds:
             return ()
         end_pos = max(0.0, min(len(self.frames) - 1, seconds / self.hop_seconds))
         vals: list[float] = []
@@ -61,81 +70,26 @@ class LevelCache:
         return tuple(vals)
 
 
-class AsyncLevelAnalyzer:
-    """Non-blocking per-track peak/RMS cache manager."""
+class AsyncLevelAnalyzer(AnalysisWorker):
+    """At most one active analysis and one latest queued URI."""
 
-    def __init__(self, cache_dir: Path, logger: Callable[[str], None] | None = None):
-        self.cache_dir = cache_dir
-        self.logger = logger or (lambda _msg: None)
-        self.current_uri = ""
-        self.current_cache: LevelCache | None = None
-        self.pending_uri = ""
-        self.worker: threading.Thread | None = None
-        self.lock = threading.Lock()
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        prune_cache(self.cache_dir)
+    def _load(self, uri, cache_dir):
+        return load_cache(uri, cache_dir)
 
-    def request(self, uri: str) -> LevelCache | None:
-        if not uri:
-            with self.lock:
-                self.current_uri = ""
-                self.current_cache = None
-                self.pending_uri = ""
-            return None
+    def _analyze(self, uri, register_process):
+        return analyze_uri(uri, register_process=register_process)
 
-        with self.lock:
-            if uri == self.current_uri:
-                return self.current_cache
-            if uri == self.pending_uri:
-                return None
+    def _available(self):
+        return ffmpeg_available()
 
-        cached = load_cache(uri, self.cache_dir)
-        if cached:
-            with self.lock:
-                self.current_uri = uri
-                self.current_cache = cached
-                self.pending_uri = ""
-            self.logger(f"meter cache hit frames={len(cached.frames)} uri={short_uri(uri)}")
-            return cached
+    def _path(self, cache_dir, uri):
+        return cache_path(cache_dir, uri)
 
-        if not ffmpeg_available():
-            self.logger("meter analysis disabled: ffmpeg not available")
-            return None
+    def _write(self, path, cache):
+        write_cache(path, cache)
 
-        with self.lock:
-            self.pending_uri = uri
-        self.worker = threading.Thread(target=self._worker, args=(uri,), daemon=True, name="p2278e-meter-analyzer")
-        self.worker.start()
-        self.logger(f"meter analysis queued uri={short_uri(uri)}")
-        return None
-
-    def levels_at(self, uri: str, rel_time: str) -> tuple[float, ...]:
-        cache = self.request(uri)
-        return cache.levels_at(rel_time) if cache else ()
-
-    def levels_at_seconds(self, uri: str, seconds: float) -> tuple[float, ...]:
-        cache = self.request(uri)
-        return cache.levels_at_seconds(seconds) if cache else ()
-
-    def _worker(self, uri: str) -> None:
-        try:
-            t0 = time.monotonic()
-            cache = analyze_uri(uri)
-            path = cache_path(self.cache_dir, uri)
-            tmp = path.with_suffix(".tmp")
-            write_cache(path, cache)
-            prune_cache(self.cache_dir)
-            with self.lock:
-                if self.pending_uri == uri:
-                    self.current_uri = uri
-                    self.current_cache = cache
-                    self.pending_uri = ""
-            self.logger(f"meter analysis ready frames={len(cache.frames)} seconds={time.monotonic() - t0:.2f} uri={short_uri(uri)}")
-        except Exception as exc:
-            with self.lock:
-                if self.pending_uri == uri:
-                    self.pending_uri = ""
-            self.logger(f"meter analysis failed {type(exc).__name__}")
+    def _prune(self, cache_dir):
+        prune_cache(cache_dir)
 
 
 def parse_hms(value: str) -> float | None:
@@ -188,6 +142,8 @@ def load_cache(uri: str, cache_dir: Path) -> LevelCache | None:
     if not path.exists():
         return None
     try:
+        if path.stat().st_size > MAX_CACHE_ENTRY_BYTES:
+            return None
         data = json.loads(path.read_text())
         if not data.get("frames"):
             return None
@@ -231,13 +187,10 @@ def write_cache(path: Path, cache: LevelCache) -> None:
         "mode": cache.mode,
         "frames": cache.frames,
     }
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, separators=(",", ":")))
-    tmp.chmod(0o600)
-    tmp.replace(path)
+    write_bounded_json(path, payload, MAX_CACHE_ENTRY_BYTES)
 
 
-def prune_cache(cache_dir: Path, max_files: int = MAX_CACHE_FILES, max_age_seconds: int = MAX_CACHE_AGE_SECONDS) -> None:
+def prune_cache(cache_dir: Path, max_files: int = MAX_CACHE_FILES, max_age_seconds: int = MAX_CACHE_AGE_SECONDS, max_total_bytes: int = MAX_CACHE_TOTAL_BYTES) -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
     now = time.time()
     for path in list(cache_dir.glob("*.levels.json")):
@@ -252,6 +205,16 @@ def prune_cache(cache_dir: Path, max_files: int = MAX_CACHE_FILES, max_age_secon
             path.unlink(missing_ok=True)
         except OSError:
             pass
+    total = 0
+    for path in files[:max_files]:
+        try:
+            size = path.stat().st_size
+            if total + size > max_total_bytes or size > MAX_CACHE_ENTRY_BYTES:
+                path.unlink(missing_ok=True)
+            else:
+                total += size
+        except OSError:
+            pass
     for path in cache_dir.glob("*.tmp"):
         try:
             if now - path.stat().st_mtime > 10 * 60:
@@ -260,9 +223,57 @@ def prune_cache(cache_dir: Path, max_files: int = MAX_CACHE_FILES, max_age_secon
             pass
 
 
-def analyze_uri(uri: str) -> LevelCache:
-    # No decoded PCM is written to disk. ffmpeg streams float32 mono PCM to stdout;
-    # only compact envelope summaries are cached.
+def analysis_duration_limit() -> float:
+    """Duration cap whose mono float32 decode fits the PCM byte budget."""
+    return min(MAX_ANALYSIS_SECONDS, MAX_FFMPEG_OUTPUT_BYTES / (SAMPLE_RATE * 4))
+
+
+def _read_bounded_pcm(proc, *, limit: int, timeout: float) -> memoryview:
+    """Read stdout into a fixed-size buffer, never exceeding the PCM limit."""
+    output = bytearray(limit)
+    output_view = memoryview(output)
+    written = 0
+    deadline = time.monotonic() + timeout
+    selector = selectors.DefaultSelector()
+    selector.register(proc.stdout, selectors.EVENT_READ)
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                signal_process_group(proc, signal.SIGKILL)
+                try:
+                    proc.wait(timeout=1)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+                raise TimeoutError("level analysis timed out")
+            remaining_bytes = limit - written
+            chunk = os.read(proc.stdout.fileno(), min(64 * 1024, remaining_bytes + 1))
+            if not chunk:
+                break
+            if len(chunk) > remaining_bytes:
+                signal_process_group(proc, signal.SIGKILL)
+                try:
+                    proc.wait(timeout=1)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+                raise RuntimeError("decoded audio exceeded PCM byte budget")
+            output_view[written : written + len(chunk)] = chunk
+            written += len(chunk)
+        proc.wait(timeout=max(0.001, deadline - time.monotonic()))
+        return output_view[:written]
+    except subprocess.TimeoutExpired:
+        signal_process_group(proc, signal.SIGKILL)
+        try:
+            proc.wait(timeout=1)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        raise TimeoutError("level analysis timed out") from None
+    finally:
+        selector.close()
+
+
+def analyze_uri(uri: str, register_process=None) -> LevelCache:
+    # ffmpeg's mono float32 output is capped by both duration and decoded bytes.
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -270,6 +281,8 @@ def analyze_uri(uri: str) -> LevelCache:
         "error",
         "-i",
         uri,
+        "-t",
+        f"{analysis_duration_limit():.6f}",
         "-vn",
         "-ac",
         "1",
@@ -277,10 +290,31 @@ def analyze_uri(uri: str) -> LevelCache:
         str(SAMPLE_RATE),
         "-f",
         "f32le",
+        "-fs",
+        str(MAX_FFMPEG_OUTPUT_BYTES),
         "-",
     ]
-    raw = subprocess.check_output(cmd, timeout=90)
-    samples = np.frombuffer(raw, dtype=np.float32).copy()
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True
+    )
+    try:
+        if register_process:
+            register_process(proc)
+        raw = _read_bounded_pcm(
+            proc, limit=MAX_ANALYSIS_PCM_BYTES, timeout=90
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed rc={proc.returncode}")
+        if len(raw) % np.dtype(np.float32).itemsize:
+            raise RuntimeError("ffmpeg returned incomplete float32 PCM")
+    finally:
+        if proc.poll() is None:
+            signal_process_group(proc, signal.SIGKILL)
+        try:
+            proc.wait(timeout=1)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    samples = np.frombuffer(raw, dtype=np.float32)
     if samples.size == 0:
         return LevelCache(uri=uri, sample_rate=SAMPLE_RATE, hop_seconds=HOP_SECONDS, block_size=BLOCK_SIZE, mode=MODE, frames=[])
     samples = np.nan_to_num(samples, copy=False)

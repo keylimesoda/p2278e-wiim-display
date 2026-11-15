@@ -32,6 +32,7 @@ struct Args {
     int sample_rate = 48000;
     int window = 2048;
     int hop = 800;
+    size_t max_samples = 4'000'000;
     double attack = 0.68;
     double release = 0.14;
 };
@@ -60,7 +61,7 @@ const double kBandGain[9] = {0.92, 0.94, 0.98, 1.00, 1.00, 1.04, 1.08, 1.12, 1.1
 void usage(const char* argv0) {
     std::cerr << "usage: " << argv0
               << " [--sample-rate 48000] [--window 2048] [--hop 800]"
-              << " [--attack 0.68] [--release 0.14]\n";
+              << " [--attack 0.68] [--release 0.14] [--max-samples 4000000]\n";
 }
 
 bool parse_int(const char* s, int* out) {
@@ -97,6 +98,12 @@ Args parse_args(int argc, char** argv) {
             if (!parse_int(need("--window"), &args.window)) std::exit(2);
         } else if (key == "--hop") {
             if (!parse_int(need("--hop"), &args.hop)) std::exit(2);
+        } else if (key == "--max-samples") {
+            const char* value = need("--max-samples");
+            char* end = nullptr;
+            unsigned long long parsed = std::strtoull(value, &end, 10);
+            if (!end || *end || parsed == 0 || parsed > 100'000'000ULL) std::exit(2);
+            args.max_samples = static_cast<size_t>(parsed);
         } else if (key == "--attack") {
             if (!parse_double(need("--attack"), &args.attack)) std::exit(2);
         } else if (key == "--release") {
@@ -119,14 +126,16 @@ Args parse_args(int argc, char** argv) {
     return args;
 }
 
-std::vector<float> read_stdin_f32() {
+std::vector<float> read_stdin_f32(size_t max_samples) {
     std::vector<float> out;
+    out.reserve(max_samples);
     constexpr size_t kChunkFloats = 16384;
     float buf[kChunkFloats];
-    while (true) {
-        size_t n = std::fread(buf, sizeof(float), kChunkFloats, stdin);
+    while (out.size() < max_samples) {
+        const size_t requested = std::min(kChunkFloats, max_samples - out.size());
+        size_t n = std::fread(buf, sizeof(float), requested, stdin);
         if (n > 0) out.insert(out.end(), buf, buf + n);
-        if (n < kChunkFloats) {
+        if (n < requested) {
             if (std::ferror(stdin)) {
                 std::cerr << "stdin read failed: " << std::strerror(errno) << "\n";
                 std::exit(1);
@@ -259,8 +268,9 @@ void write_json(const std::vector<std::vector<double>>& frames, const Args& args
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::setvbuf(stdin, nullptr, _IONBF, 0);
     Args args = parse_args(argc, argv);
-    std::vector<float> samples = read_stdin_f32();
+    std::vector<float> samples = read_stdin_f32(args.max_samples);
     std::vector<std::vector<double>> frames = analyze(samples, args);
     write_json(frames, args);
     return 0;
