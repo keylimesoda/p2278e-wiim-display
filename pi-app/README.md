@@ -56,6 +56,14 @@ python scripts/display_live.py --duration 0
 Flags: `--brightness`, `--fps {20,30}`, `--viz {levels,spectrum}`, `--base-url`,
 and `--refresh`. Defaults come from `config.json` when flags are omitted.
 
+Metadata polling is bounded to an 8-second overall deadline. SOAP bodies are
+limited to 256 KiB, device-description bodies to 128 KiB, and SSDP retains at
+most 16 description locations per pass. Description fetches share the remaining
+deadline and a 16-worker global cap, so a slow unrelated UPnP device cannot block
+a responsive WiiM or accumulate workers across retries. If a metadata request is
+still pending at its deadline, the appliance starts aging last-known-good content
+as stale/searching while the worker winds down.
+
 Health is written atomically to `run/health.json`. Analysis caches contain only
 numeric envelopes keyed by a URL hash; raw media URLs and query tokens are not
 persisted. Runtime state, configuration, tokens, caches, and logs are ignored by
