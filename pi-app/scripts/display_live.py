@@ -30,6 +30,7 @@ from p2278e_display.appliance import (
     UNKNOWN_DURATION,
     UserState,
     apply_async_result,
+    advance_pending_fetch_failure,
     reduce,
     result_is_current,
     should_sleep_no_info,
@@ -41,7 +42,12 @@ from p2278e_display.health import HealthWriter
 from p2278e_display.matrix import image_to_framebuffer, make_matrix
 from p2278e_display.render import NowPlaying, render_now_playing
 from p2278e_display.system_health import PowerThermalSampler
-from p2278e_display.wiim import WiiMState, discover_wiim, get_now_playing
+from p2278e_display.wiim import (
+    MAX_METADATA_FETCH_SECONDS,
+    WiiMState,
+    discover_wiim,
+    get_now_playing,
+)
 
 running = True
 
@@ -110,17 +116,18 @@ def notify_systemd(message: str) -> None:
 
 
 def fetch_resilient(current_url: str) -> tuple[WiiMState, str]:
+    deadline = time.monotonic() + MAX_METADATA_FETCH_SECONDS
     if current_url:
         try:
-            return get_now_playing(current_url), current_url
+            return get_now_playing(current_url, deadline=deadline), current_url
         except Exception as original_error:
             try:
-                discovered = discover_wiim(friendly_name=friendly_name)
-                return get_now_playing(discovered), discovered
+                discovered = discover_wiim(friendly_name=friendly_name, deadline=deadline)
+                return get_now_playing(discovered, deadline=deadline), discovered
             except Exception:
                 raise original_error
-    discovered = discover_wiim(friendly_name=friendly_name)
-    return get_now_playing(discovered), discovered
+    discovered = discover_wiim(friendly_name=friendly_name, deadline=deadline)
+    return get_now_playing(discovered, deadline=deadline), discovered
 
 
 def normalize_transport(value: str) -> Transport:
@@ -180,6 +187,8 @@ appliance = ApplianceState.initial(started_mono)
 metadata_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wiim-fetch")
 art_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="art-fetch")
 metadata_future: Future | None = None
+metadata_started_at: float | None = None
+metadata_timeout_reported = False
 art_jobs: dict[Future, tuple[int, str, str]] = {}
 current_art_path = ""
 current_track_uri = ""
@@ -253,7 +262,26 @@ try:
         retry_interval = min(18.0, args.refresh * (2 ** min(fetch_errors, 3)))
         if metadata_future is None and t - last_fetch >= retry_interval:
             last_fetch = t
+            metadata_started_at = t
+            metadata_timeout_reported = False
             metadata_future = metadata_pool.submit(fetch_resilient, base_url)
+
+        pending_fetch_expired = False
+        if (
+            metadata_future is not None
+            and not metadata_future.done()
+            and metadata_started_at is not None
+        ):
+            appliance, pending_fetch_expired = advance_pending_fetch_failure(
+                appliance,
+                now=t,
+                started_at=metadata_started_at,
+                timeout_s=MAX_METADATA_FETCH_SECONDS,
+            )
+            if pending_fetch_expired and not metadata_timeout_reported:
+                fetch_errors += 1
+                metadata_timeout_reported = True
+                log("WiiM metadata request exceeded its deadline")
 
         metadata_result_processed = False
         if metadata_future is not None and metadata_future.done():
@@ -299,16 +327,23 @@ try:
                 if current_track_uri:
                     analyzer.request(current_track_uri)
             except Exception as exc:
-                fetch_errors += 1
+                if not metadata_timeout_reported:
+                    fetch_errors += 1
                 appliance = reduce(appliance, Observation.failure(t))
                 log(f"display fetch error {type(exc).__name__}: {exc}")
             finally:
                 metadata_future = None
+                metadata_started_at = None
+                metadata_timeout_reported = False
 
         # Advance STARTING/stale/searching timers continuously between retries.
         # Do not apply the same failure twice on the iteration that consumed a
         # completed metadata result.
-        if appliance.last_fail_at >= 0 and not metadata_result_processed:
+        if (
+            appliance.last_fail_at >= 0
+            and not metadata_result_processed
+            and not pending_fetch_expired
+        ):
             appliance = reduce(appliance, Observation.failure(t))
 
         for finished in [job for job in art_jobs if job.done()]:

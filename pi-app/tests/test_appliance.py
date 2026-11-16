@@ -21,6 +21,7 @@ from p2278e_display.appliance import (  # noqa: E402
     FAULT_SEARCHING_AFTER_S,
     STARTUP_CONNECT_TIMEOUT_S,
     apply_async_result,
+    advance_pending_fetch_failure,
     reduce,
     result_is_current,
     should_sleep_no_info,
@@ -289,6 +290,27 @@ def test_fetch_failure_preserves_content_short():
     assert s.state is UserState.NOW_PLAYING
     assert s.content.title == "Keep"
     assert s.stale is False
+
+
+def test_pending_fetch_deadline_starts_stale_failure_clock():
+    s = ApplianceState.initial(0.0)
+    s = reduce(s, playing(1.0, title="Keep"))
+    s, expired = advance_pending_fetch_failure(s, now=10.0, started_at=1.0, timeout_s=8.0)
+    assert expired is True
+    assert s.last_fail_at == 10.0
+    s, expired = advance_pending_fetch_failure(
+        s, now=10.0 + STALE_AFTER_S + 0.1, started_at=1.0, timeout_s=8.0
+    )
+    assert expired is True
+    assert s.stale is True
+    assert s.content.title == "Keep"
+
+
+def test_pending_fetch_before_deadline_does_not_mark_failure():
+    s = ApplianceState.initial(0.0)
+    s, expired = advance_pending_fetch_failure(s, now=7.9, started_at=0.0, timeout_s=8.0)
+    assert expired is False
+    assert s.last_fail_at == -1.0
 
 
 def test_stale_after_12s():

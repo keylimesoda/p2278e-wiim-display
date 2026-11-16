@@ -217,6 +217,15 @@ def result_is_current(state: ApplianceState, result: AsyncResult) -> bool:
     )
 
 
+def advance_pending_fetch_failure(
+    state: ApplianceState, now: float, started_at: float, timeout_s: float
+) -> tuple[ApplianceState, bool]:
+    """Age content as failed once a metadata request exceeds its deadline."""
+    if now - started_at < timeout_s:
+        return state, False
+    return reduce(state, Observation.failure(now)), True
+
+
 def should_sleep_no_info(
     state: ApplianceState, now: float, timeout_s: float
 ) -> bool:
